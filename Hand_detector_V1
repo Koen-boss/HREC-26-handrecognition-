@@ -1,0 +1,185 @@
+import cv2
+import mediapipe as mp
+from picamera2 import Picamera2
+from gpiozero import LED
+import serial
+from time import sleep
+import threading
+
+# Initialize MediaPipe Hands
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+# Communication setup
+# MAX3485 direction pins
+REPin = LED(26)   # receive pin
+DEPin = LED(13)   # driver pin
+
+# Starting TX and RX UART communication
+ser = serial.Serial(
+    port="/dev/serial0",
+    baudrate=9600,
+    timeout=0.1
+)
+
+# Communication definitions
+deviceID = 0x06
+dataIndicator = 0xFF
+highByte = 0x00
+lowByte = 0x00
+
+# Hand detection status (shared between threads)
+hand_in_roi = False
+hand_status_lock = threading.Lock()
+
+# Communication functions
+def sendData(_data: int):
+    try:
+        # give controller some time to let go of bus control
+        sleep(0.002) 
+        # setting the MAX3485 in transceiver mode
+        DEPin.on()
+        REPin.on()
+        # settle line
+        sleep(0.02)
+        # transmit data
+        ser.write(bytes([dataIndicator]))
+        ser.write(bytes([_data]))
+        # waiting for data to be sent
+        ser.flush()
+        # setting the MAX3485 back in receiver mode
+        DEPin.off()
+        REPin.off()
+    except:
+        print("data transmission failed")
+
+def receiveData():
+    global highByte, lowByte
+    # reading and shifting byte if data is available from serial buffer
+    if ser.in_waiting > 0: 
+        print("Data received!")
+        # byte shifting
+        highByte = lowByte
+        # reading byte from serial
+        lowByte = ser.read(1)[0]
+        print("highbyte=", highByte, "lowbyte=", lowByte)
+        # checking whether there is a match between the device id
+        if highByte == deviceID:
+            print("Device ID match found - responding with hand status")
+            return True, lowByte
+    return False, lowByte
+
+def communication_thread():
+    """Thread to handle communication with controller"""
+    while True:
+        status, _lowByte = receiveData()
+        if status:
+            # Controller is asking for hand status
+            with hand_status_lock:
+                if hand_in_roi:
+                    print("Sending 0x021 (hand detected)")
+                    sendData(0x021)
+                else:
+                    print("Sending 0x022 (no hand detected)")
+                    sendData(0x022)
+        # sleep to not have cpu run at 100% load
+        sleep(0.1)
+
+# Configuration: adjust as needed
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+# Initialize the Raspberry Pi camera
+picam2 = Picamera2()
+camera_config = picam2.create_preview_configuration(main={"size": (640, 480)})
+picam2.configure(camera_config)
+picam2.start()
+
+# Start communication thread
+comm_thread = threading.Thread(target=communication_thread, daemon=True)
+comm_thread.start()
+
+# Define detection rectangle (you can adjust these coordinates)
+detection_rect = {
+    'x': 200,      # Left edge
+    'y': 150,      # Top edge
+    'width': 240,  # Width
+    'height': 180  # Height
+}
+
+while True:
+    # Capture frame from Pi Camera
+    frame = picam2.capture_array()
+
+    # Convert to BGR format if needed (Picamera2 might output RGB or RGBA)
+    if frame.shape[2] == 4:  # RGBA format
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+    elif frame.shape[2] == 3 and frame.dtype == 'uint8':  # RGB format
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+    # Flip image if you want mirror view
+    # frame = cv2.flip(frame, 1)
+
+    # Convert BGR?RGB for MediaPipe
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    # Let MediaPipe process and detect hands
+    results = hands.process(img_rgb)
+
+    # Draw the detection rectangle
+    rect_color = (255, 0, 0)  # Blue rectangle by default
+    hand_detected_in_rect = False
+
+    # Draw detected hands & landmarks
+    if results.multi_hand_landmarks:
+        h, w, _ = frame.shape
+        for hand_landmarks in results.multi_hand_landmarks:
+            # Draw landmarks & connections
+            mp_drawing.draw_landmarks(
+                frame, hand_landmarks, mp_hands.HAND_CONNECTIONS
+            )
+
+            # Check if any hand landmarks are inside the detection rectangle
+            for landmark in hand_landmarks.landmark:
+                x = int(landmark.x * w)
+                y = int(landmark.y * h)
+                
+                # Check if this landmark is inside the detection rectangle
+                if (detection_rect['x'] <= x <= detection_rect['x'] + detection_rect['width'] and
+                    detection_rect['y'] <= y <= detection_rect['y'] + detection_rect['height']):
+                    hand_detected_in_rect = True
+                    break
+            
+            # Draw bounding box around hand (always draw this)
+            xs = [lm.x for lm in hand_landmarks.landmark]
+            ys = [lm.y for lm in hand_landmarks.landmark]
+            x_min = int(min(xs) * w)
+            x_max = int(max(xs) * w)
+            y_min = int(min(ys) * h)
+            y_max = int(max(ys) * h)
+            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0,255,0), 2)
+    # Change rectangle color if hand detected and update shared status
+    with hand_status_lock:
+        hand_in_roi = hand_detected_in_rect
+    
+    if hand_detected_in_rect:
+        rect_color = (0, 255, 0)  # Green when hand detected
+        print("Hand detected in rectangle!")
+
+    # Draw the detection rectangle
+    cv2.rectangle(frame, 
+                  (detection_rect['x'], detection_rect['y']), 
+                  (detection_rect['x'] + detection_rect['width'], 
+                   detection_rect['y'] + detection_rect['height']), 
+                  rect_color, 3)
+
+    cv2.imshow("Hand Detection", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# Cleanup
+picam2.stop()
+cv2.destroyAllWindows()
